@@ -1,0 +1,300 @@
+{
+  "exchange": "binance_futures",
+  "quote_asset": "USDC",
+  "symbols": [
+    "BTCUSDC",
+    "ETHUSDC",
+    "SOLUSDC",
+    "BNBUSDC",
+    "LINKUSDC",
+    "DOGEUSDC",
+    "1000SHIBUSDC",
+    "1000PEPEUSDC",
+    "PENGUUSDC",
+    "WIFUSDC"
+  ],
+  "timeframes": {
+    "trend": "4h",
+    "entry": "1h",
+    "micro": "15m"
+  },
+  "trend_filter": {
+    "ema": 200,
+    "min_candles_same_slope": 2,
+    "adx_period": 14,
+    "adx_min": 20
+  },
+  "entries": {
+    "pullback": {
+      "ema": 20,
+      "use_fib": true,
+      "fib_zone": [
+        0.382,
+        0.618
+      ],
+      "rsi_period": 14,
+      "rsi_threshold": 50
+    },
+    "breakout": {
+      "lookback": 10,
+      "vol_boost_pct": 120
+    },
+    "ensemble": {
+      "full_if_both": true,
+      "half_if_single": true
+    }
+  },
+  "stops": {
+    "atr_period": 14,
+    "initial_atr_mult": 3.5,
+    "breakeven_at_r": 1.0
+  },
+  "take_profit": {
+    "partial_r": 1.8,
+    "partial_pct": 40
+  },
+  "trailing": {
+    "atr_period": 14,
+    "atr_mult": 2.3,
+    "min_stop_move_ticks": 2
+  },
+  "risk": {
+    "mode": "fixed_usdc",
+    "pct": 0.005,
+    "base_usdc": 5,
+    "min_usdc": 5,
+    "max_usdc": 50,
+    "max_balance_pct": 0.75,
+    "kelly_k": 0.3,
+    "daily_loss_limit_pct": 2.5,
+    "consecutive_losses_pause": 3,
+    "pause_hours": 12
+  },
+  "entry_policy": {
+    "mode": "auto",
+    "pullback": {
+      "price_mode": "fib_mid",
+      "ema_distance_atr_frac": 0.25,
+      "expiry_bars": {
+        "range": 2,
+        "trend": 2,
+        "strong": 1
+      },
+      "max_chase_bps": 10,
+      "min_confidence": 0.7
+    },
+    "breakout": {
+      "confirm_bars": 1,
+      "retest_expire_bars": 2
+    }
+  },
+  "funding_filter": {
+    "enabled": true,
+    "threshold_pos": 0.0005,
+    "threshold_neg": -0.0005,
+    "stretch_atr_mult": 2.0,
+    "ema_ref": 20,
+    "action": "reduce_or_block"
+  },
+  "leverage": {
+    "max": 15,
+    "base": 12
+  },
+  "leverage_policy": {
+    "low": 8,
+    "normal": 12,
+    "high": 15,
+    "low_threshold": 0.3,
+    "high_threshold": 0.8
+  },
+  "portfolio": {
+    "max_concurrent": 3,
+    "cooldown_bars": 2,
+    "clusters": {
+      "BTCUSDC": [
+        "ETHUSDC",
+        "BNBUSDC"
+      ],
+      "ETHUSDC": [
+        "BTCUSDC",
+        "BNBUSDC"
+      ],
+      "SOLUSDC": [
+        "LINKUSDC"
+      ],
+      "DOGEUSDC": [
+        "1000SHIBUSDC",
+        "1000PEPEUSDC",
+        "PENGUUSDC",
+        "WIFUSDC"
+      ],
+      "1000SHIBUSDC": [
+        "DOGEUSDC",
+        "1000PEPEUSDC",
+        "PENGUUSDC",
+        "WIFUSDC"
+      ],
+      "1000PEPEUSDC": [
+        "DOGEUSDC",
+        "1000SHIBUSDC",
+        "PENGUUSDC",
+        "WIFUSDC"
+      ],
+      "PENGUUSDC": [
+        "DOGEUSDC",
+        "1000SHIBUSDC",
+        "1000PEPEUSDC",
+        "WIFUSDC"
+      ],
+      "WIFUSDC": [
+        "DOGEUSDC",
+        "1000SHIBUSDC",
+        "1000PEPEUSDC",
+        "PENGUUSDC"
+      ]
+    },
+    "limits": {
+      "max_longs": 3,
+      "max_shorts": 3,
+      "max_memecoin_notional": 200,
+      "risk_scale_steps": [
+        1.0,
+        0.7,
+        0.5
+      ]
+    }
+  },
+  "simulation": {
+    "slippage_pct": 0.0005
+  },
+  "fees": {
+    "maker": 0.00018,
+    "taker": 0.00036
+  },
+  "session": {
+    "start_utc": "00:00",
+    "end_utc": "23:59"
+  },
+  "logging": {
+    "telegram": true,
+    "level": "info"
+  },
+  "telegram": {
+    "token_env": "TELEGRAM_TOKEN",
+    "chat_id_env": "TELEGRAM_CHAT_ID",
+    "throttle_seconds": 60
+  },
+  "style": "lively",
+  "timezone": "Europe/Oslo",
+  "reports": {
+    "daily_enabled": true,
+    "daily_time_local": "23:59"
+  },
+  "startup_checks": {
+    "enabled": true,
+    "expect_isolated": true,
+    "max_leverage": 15,
+    "min_usdc_balance": 0
+  },
+  "autofix": {
+    "enabled": true,
+    "margin_type": "ISOLATED",
+    "leverage": 12
+  },
+  "meme": {
+    "symbols": [
+      "DOGEUSDC",
+      "1000SHIBUSDC",
+      "1000PEPEUSDC",
+      "PENGUUSDC",
+      "WIFUSDC"
+    ],
+    "risk_mult_default": 0.7,
+    "lev_cap_default": 10,
+    "funding_pos": 0.0003,
+    "funding_neg": -0.0003,
+    "atr_price_cap": 0.015,
+    "max_concurrent": 1,
+    "per_symbol": {
+      "DOGEUSDC": {
+        "risk_mult": 0.7,
+        "lev_cap": 10
+      },
+      "1000SHIBUSDC": {
+        "risk_mult": 0.6,
+        "lev_cap": 8
+      },
+      "1000PEPEUSDC": {
+        "risk_mult": 0.6,
+        "lev_cap": 8
+      },
+      "PENGUUSDC": {
+        "risk_mult": 0.6,
+        "lev_cap": 8
+      },
+      "WIFUSDC": {
+        "risk_mult": 0.6,
+        "lev_cap": 8
+      }
+    }
+  },
+  "live_trading": true,
+  "micro_entry": {
+    "ema_fast": 21,
+    "ema_slow": 55,
+    "stoch_rsi": {
+      "k": 14,
+      "d": 3,
+      "rsi_len": 14,
+      "smooth": 3,
+      "ob": 80,
+      "os": 20
+    },
+    "bar_close_only": true,
+    "cooldown_s": 240,
+    "dedup_bars": 8,
+    "confirm_mid_tf_trend": true,
+    "smart_entry": {
+      "enabled": true,
+      "method": "pullback_to_ema",
+      "max_wait_bars": 2,
+      "limit_offset_atr": 0.25,
+      "ema_ref": "fast"
+    }
+  },
+  "entry_mode": "15m",
+  "ws": {
+    "enabled": false,
+    "klines": [
+      "15m",
+      "1h"
+    ],
+    "mark_price": true
+  },
+  "cross_lock": {
+    "enabled": true,
+    "lock_bars_15m": 4,
+    "lock_bars_1h": 1
+  },
+  "killswitch": {
+    "enabled": true,
+    "atr_mult": 3.0,
+    "cooloff_min": 15
+  },
+  "notifier": {
+    "throttle": {
+      "enabled": true,
+      "defaults": {
+        "seconds": 60
+      },
+      "keys": {
+        "funding_lock": 300,
+        "no_balance": 180,
+        "min_notional": 180,
+        "max_longs": 120,
+        "max_shorts": 120,
+        "killswitch": 600
+      }
+    }
+  }
+}

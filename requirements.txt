@@ -1,0 +1,8 @@
+pandas
+numpy
+ta
+python-binance
+websocket-client
+pytz
+python-dotenv
+requests

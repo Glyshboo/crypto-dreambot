@@ -1,0 +1,14 @@
+{
+  "risk": {
+    "mode": "fixed_usdc",
+    "pct": 0.02,
+    "base_usdc": 5.0,
+    "min_usdc": 5,
+    "max_usdc": 50,
+    "max_balance_pct": 0.75,
+    "kelly_k": 0.3,
+    "daily_loss_limit_pct": 2.5,
+    "consecutive_losses_pause": 3,
+    "pause_hours": 12
+  }
+}
