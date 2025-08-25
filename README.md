@@ -1,0 +1,2 @@
+# crypto-dreambot
+Trading bot
