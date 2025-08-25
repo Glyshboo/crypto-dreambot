@@ -1,5 +1,328 @@
 # --- Optional WebSocket helper (safe) ---
 ws_mgr = None
+# === Re-entry cooldown (vedvarende) ===
+import time, json as _json, os as _os
+_COOLDOWN_FILE = _os.path.join(_os.path.dirname(__file__), "reentry_state.json")
+try:
+    with open(_COOLDOWN_FILE, "r", encoding="utf-8") as _f:
+        _REENTRY_UNTIL = {k:int(v) for k,v in _json.load(_f).items()}
+except Exception:
+    _REENTRY_UNTIL = {}
+
+_HAD_OPEN_LAST = {}  # per-symbol posisjonsstatus fra forrige loop
+
+# === Re-entry cooldown (vedvarende) ===
+import time, json as _json, os as _os
+_COOLDOWN_FILE = _os.path.join(_os.path.dirname(__file__), "reentry_state.json")
+try:
+    with open(_COOLDOWN_FILE, "r", encoding="utf-8") as _f:
+        _REENTRY_UNTIL = {k:int(v) for k,v in _json.load(_f).items()}
+except Exception:
+    _REENTRY_UNTIL = {}
+
+_HAD_OPEN_LAST = {}  # per-symbol posisjonsstatus fra forrige loop
+
+# === Parallell-posisjoner og volatilitet (ATR%%) helpers ===
+# === Funding + Margin/Leverage guard helpers ===
+_SYMBOL_INFO_CACHE = {}
+_ENSURED_LEVERAGE_MARGIN = set()
+
+# === Supertrend-trail helpers (vedvarende R0 sporing) ===
+import json as _json, os as _os
+_TRAIL_FILE = _os.path.join(_os.path.dirname(__file__), "trail_state.json")
+try:
+    with open(_TRAIL_FILE, "r", encoding="utf-8") as _f:
+        _TRAIL_STATE = _json.load(_f)
+except Exception:
+    _TRAIL_STATE = {}
+
+def _trail_get_R0(sym: str):
+    try:
+        return float(_TRAIL_STATE.get(sym, {}).get("R0", 0.0)) or None
+    except Exception:
+        return None
+
+def _trail_set_R0(sym: str, R0: float):
+    try:
+        d = _TRAIL_STATE.get(sym, {}) or {}
+        d["R0"] = float(R0)
+        _TRAIL_STATE[sym] = d
+        with open(_TRAIL_FILE, "w", encoding="utf-8") as _f:
+            _json.dump(_TRAIL_STATE, _f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def _atr_value(df, period=14):
+    try:
+        import pandas as _pd
+        if df is None or len(df) < period + 2:
+            return None
+        d = df.copy()
+        H, L, C = d["high"], d["low"], d["close"]
+        tr = _pd.concat([(H - L).abs(), (H - C.shift(1)).abs(), (L - C.shift(1)).abs()], axis=1).max(axis=1)
+        atr = tr.rolling(window=period, min_periods=period).mean()
+        return float(atr.iloc[-1])
+    except Exception:
+        return None
+
+def _get_open_stop_price(client, symbol: str):
+    """Finn aktiv STOP_MARKET closePosition for symbol; returner (orderId, stopPrice) eller (None, None)."""
+    try:
+        oo = client.get_open_orders(symbol=symbol)
+        for o in oo:
+            if str(o.get("type","")).upper() == "STOP_MARKET":
+                # sjekk at dette er en close-order (reduceOnly/closePosition)
+                sp = o.get("stopPrice") or o.get("stopprice") or o.get("stop_price")
+                if sp is not None:
+                    return o.get("orderId") or o.get("orderID") or o.get("order_id"), float(sp)
+    except Exception:
+        pass
+    return None, None
+
+def _position_entry_side(client, symbol: str):
+    """Returner (entryPrice, side_str) hvis posisjon åpen, ellers (None, None)."""
+    try:
+        # robust mot ulike klientversjoner
+        try:
+            pos = client.get_position_risk()
+        except Exception:
+            try:
+                pos = client.position_risk()
+            except Exception:
+                pos = client.position_information()
+        for p in pos:
+            if p.get("symbol") == symbol:
+                amt = float(p.get("positionAmt", 0) or 0)
+                if abs(amt) > 0:
+                    entry = float(p.get("entryPrice", 0) or 0)
+                    side = "LONG" if amt > 0 else "SHORT"
+                    return entry if entry>0 else None, side
+    except Exception:
+        pass
+    return None, None
+
+def _tighten_stop_if_better(client, cfg, symbol: str, pos_side: str, new_stop: float):
+    """
+    Stram SL ved å:
+      1) kansellere eksisterende STOP_MARKET closePosition
+      2) legge ny STOP_MARKET closePosition med høyere (LONG) / lavere (SHORT) stopPrice
+    """
+    try:
+        tick, step = _exchange_filters(client, symbol)
+    except Exception:
+        try:
+            flt = get_symbol_filters(client, symbol)
+            tick, step = float(flt["tick"]), float(flt["step"])
+        except Exception:
+            tick, step = 0.0, 0.0
+
+    def _round_tick(x, t):
+        if t and t>0: 
+            return round(round(float(x)/t)*t, 12)
+        return float(x)
+
+    # Finn eksisterende stop
+    oid, cur_sp = _get_open_stop_price(client, symbol)
+    # Sjekk forbedring
+    if cur_sp is not None:
+        if pos_side == "LONG" and not (new_stop > float(cur_sp)):
+            return False
+        if pos_side == "SHORT" and not (new_stop < float(cur_sp)):
+            return False
+
+    new_sp = _round_tick(new_stop, tick)
+    stop_side = "SELL" if pos_side=="LONG" else "BUY"
+
+    # Avbryt gammel order hvis vi fant en
+    try:
+        if oid is not None:
+            client.cancel_order(symbol=symbol, orderId=int(oid))
+    except Exception:
+        pass
+
+    # Legg ny STOP_MARKET (closePosition primært, fallback reduceOnly)
+    try:
+        _place_order_with_retries(client, symbol=symbol, side=stop_side, type="STOP_MARKET",
+                                  workingType="MARK_PRICE", stopPrice=str(new_sp), closePosition=True)
+    except Exception:
+        _place_order_with_retries(client, symbol=symbol, side=stop_side, type="STOP_MARKET",
+                                  workingType="MARK_PRICE", stopPrice=str(new_sp), reduceOnly="true")
+    return True
+
+def _entry_and_stop(client, symbol: str):
+    e, _ = _position_entry_side(client, symbol)
+    _, sp = _get_open_stop_price(client, symbol)
+    return e, sp\n\ndef _exchange_info_symbol(client, symbol):
+    try:
+        if symbol in _SYMBOL_INFO_CACHE:
+            return _SYMBOL_INFO_CACHE[symbol]
+        ei = client.exchange_info()
+        for s in ei.get("symbols", []):
+            if s.get("symbol") == symbol:
+                _SYMBOL_INFO_CACHE[symbol] = s
+                return s
+    except Exception:
+        pass
+    return {}
+
+def _symbol_margin_asset(client, symbol):
+    # USDⓈ-M futures: marginAsset er typisk "USDT" (noen "USDC").
+    info = _exchange_info_symbol(client, symbol) or {}
+    return info.get("marginAsset") or "USDT"
+
+def _futures_balances(client):
+    # Returner dict asset->free (USDⓈ-M)
+    out = {}
+    try:
+        bals = client.balance()
+    except Exception:
+        try:
+            bals = client.futures_account_balance()
+        except Exception:
+            bals = []
+    try:
+        for b in bals:
+            asset = b.get("asset") or b.get("asset".lower())
+            free = float(b.get("balance") or b.get("withdrawAvailable") or b.get("availableBalance") or b.get("availableBal") or b.get("free") or 0.0)
+            if asset:
+                out[asset] = max(out.get(asset, 0.0), free)
+    except Exception:
+        pass
+    return out
+
+def _ensure_leverage_margin(client, symbol, lev=12, marginType="ISOLATED"):
+    # Kall bare én gang per symbol per prosess
+    key = f"{symbol}|{lev}|{marginType}"
+    if key in _ENSURED_LEVERAGE_MARGIN:
+        return
+    try:
+        # margin type
+        try:
+            client.change_margin_type(symbol=symbol, marginType=marginType)
+        except Exception:
+            # -4046: No need to change, ignorer
+            pass
+        # leverage
+        try:
+            client.change_leverage(symbol=symbol, leverage=int(lev))
+        except Exception:
+            pass
+    except Exception:
+        pass
+    _ENSURED_LEVERAGE_MARGIN.add(key)
+
+def _premium_funding_rate(client, symbol):
+    """
+    Hent gjeldende funding via premiumIndex (har lastFundingRate) – fallback til funding_rate history.
+    Returnerer float (per 8t), signert (+ betyr longs betaler).
+    """
+    try:
+        px = client.premium_index(symbol=symbol)
+        if isinstance(px, dict) and "lastFundingRate" in px:
+            return float(px["lastFundingRate"])
+    except Exception:
+        pass
+    try:
+        fr = client.funding_rate(symbol=symbol, limit=1)
+        if isinstance(fr, list) and fr:
+            return float(fr[-1].get("fundingRate", 0.0))
+    except Exception:
+        pass
+    return 0.0
+
+def _dir_penalized(bias_dir, funding_rate, directional=True):
+    """
+    Long betaler ved positiv funding. Short betaler ved negativ funding.
+    Hvis directional=False, straff alltid etter absoluttverdi.
+    """
+    if not directional:
+        return abs(funding_rate), True
+    d = (str(bias_dir) or "").upper()
+    if d == "LONG" and funding_rate > 0:
+        return abs(funding_rate), True
+    if d == "SHORT" and funding_rate < 0:
+        return abs(funding_rate), True
+    return abs(funding_rate), False\n\ndef _count_open_positions(client):
+    """
+    Returnerer antall symbols med åpen posisjon (amt != 0).
+    Robust mot ulike binance endepunkter.
+    """
+    try:
+        # UMFutures position endpoints varierer med lib-versjon
+        try:
+            data = client.get_position_risk()
+        except Exception:
+            data = client.position_risk()
+    except Exception:
+        try:
+            data = client.position_information()
+        except Exception:
+            data = []
+    cnt = 0
+    try:
+        for p in data:
+            amt = float(p.get("positionAmt") or p.get("positionAmt".lower()) or 0)
+            if abs(amt) > 0:
+                cnt += 1
+    except Exception:
+        pass
+    return cnt
+
+def _atr_percent(df, period=14):
+    """
+    ATR% = ATR / close. Bruker klassisk ATR (mean TR n-perioder).
+    Forventer kolonner: high, low, close.
+    """
+    try:
+        import pandas as _pd
+        if df is None or len(df) < period + 2:
+            return None
+        d = df.copy()
+        H, L, C = d["high"], d["low"], d["close"]
+        tr = _pd.concat([(H - L).abs(), (H - C.shift(1)).abs(), (L - C.shift(1)).abs()], axis=1).max(axis=1)
+        atr = tr.rolling(window=period, min_periods=period).mean()
+        last_close = float(C.iloc[-1])
+        last_atr = float(atr.iloc[-1])
+        if last_close <= 0:
+            return None
+        return last_atr / last_close
+    except Exception:
+        return None\n\ndef _cooldown_hours(cfg: dict) -> int:
+    try:
+        return int(cfg.get("portfolio", {}).get("cooldown_bars_after_exit", 2))
+    except Exception:
+        return 2
+
+def _cooldown_active(sym: str) -> bool:
+    return int(time.time()*1000) < int(_REENTRY_UNTIL.get(sym, 0))
+
+def _cooldown_start(sym: str, hours: int):
+    until = int(time.time()*1000) + int(hours)*3600*1000
+    _REENTRY_UNTIL[sym] = until
+    try:
+        with open(_COOLDOWN_FILE, "w", encoding="utf-8") as _f:
+            _json.dump(_REENTRY_UNTIL, _f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def _cooldown_hours(cfg: dict) -> int:
+    try:
+        return int(cfg.get("portfolio", {}).get("cooldown_bars_after_exit", 2))
+    except Exception:
+        return 2
+
+def _cooldown_active(sym: str) -> bool:
+    return int(time.time()*1000) < int(_REENTRY_UNTIL.get(sym, 0))
+
+def _cooldown_start(sym: str, hours: int):
+    until = int(time.time()*1000) + int(hours)*3600*1000
+    _REENTRY_UNTIL[sym] = until
+    try:
+        with open(_COOLDOWN_FILE, "w", encoding="utf-8") as _f:
+            _json.dump(_REENTRY_UNTIL, _f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 def _maybe_start_ws(cfg, symbols, notifier):
     try:
         from ws_manager import WSManager
@@ -204,26 +527,197 @@ def _round_tick(p: float, tick: float):
     return (int(p/tick))*tick
 
 
-def _place_order_with_retries(client, **kwargs):
+def _place_order_with_retries(client, notifier=None, max_retries=6, backoff_base=0.6, **kwargs):
     """
-    Robust wrapper som faktisk kaller Binance-klienten (ikke seg selv).
-    Brukes for MARKET/STOP_MARKET/TAKE_PROFIT_MARKET ordrer.
+    Robust ordrefunksjon for Binance USDⓈ-M futures.
+    Forventer kwargs som brukes av client.new_order(...):
+        symbol, side, type, quantity, price, reduceOnly, closePosition, workingType, stopPrice, timeInForce, etc.
+    - Eksponentiell backoff med jitter
+    - Idempotent via newClientOrderId (samme COID ved retry)
+    - Automatisk rounding mot tick/step ved -1013/precision
+    - Fallback reduceOnly <-> closePosition for TP/SL
+    - Skalerer qty ned ved insufficient margin
     """
-    delay = 0.2
-    last_exc = None
-    for attempt in range(4):
-        try:
-            return client.new_order(**kwargs)
-        except Exception as e:
-            last_exc = e
-            if attempt == 3:
-                raise
-            time.sleep(delay)
-            delay *= 2
-    if last_exc:
-        raise last_exc
+    import time, uuid, random
+    from math import floor
 
-def _place_live_bracket(client: UMFutures, cfg: dict, broker, paper_mode: bool, notifier, symbol: str, side: str, qty: float, entry: float, stop: float, tp1: float, partial_pct: float):
+    # idempotens-lager
+    _idem_file = os.path.join(os.path.dirname(__file__), "idempotency.json")
+    try:
+        import json as _json
+        if os.path.exists(_idem_file):
+            with open(_idem_file, "r", encoding="utf-8") as _f:
+                _idem = _json.load(_f)
+        else:
+            _idem = {}
+    except Exception:
+        _idem = {}
+
+    symbol = kwargs.get("symbol")
+    side = kwargs.get("side")
+    otype = kwargs.get("type", "MARKET")
+
+    # legg til recvWindow hvis ikke satt
+    kwargs.setdefault("recvWindow", 5000)
+
+    # COID – lag stabil id for retries
+    if "newClientOrderId" not in kwargs:
+        base = f"DB-{symbol}-{side}-{otype}-{int(time.time()*1000)%100000000}"
+        coid = base + "-" + uuid.uuid4().hex[:6]
+        kwargs["newClientOrderId"] = coid
+    else:
+        coid = kwargs["newClientOrderId"]
+
+    # Idempotens: hvis vi ser samme coid som "ferdig", returnér "suksess"
+    if _idem.get(coid) == "ok":
+        return {"clientOrderId": coid, "idempotent": True}
+
+    # step/tick helpers
+    def _get_filters(sym):
+        try:
+            flt = get_symbol_filters(client, sym)
+            return float(flt["tick"]), float(flt["step"])
+        except Exception:
+            try:
+                t, s = _exchange_filters(client, sym)
+                return float(t), float(s)
+            except Exception:
+                return 0.0, 0.0
+
+    def _round_to_step(val, step):
+        if step <= 0: return float(val)
+        return floor(float(val)/step)*step
+
+    def _round_to_tick(val, tick):
+        if tick <= 0: return float(val)
+        return round(round(float(val)/tick)*tick, 12)
+
+    tick, step = _get_filters(symbol)
+
+    # sørg for str-kwargs der binance trenger str
+    def _to_str_if_needed(k, v):
+        if v is None: return v
+        if k in ("quantity","price","stopPrice","icebergQty","activationPrice","callbackRate"):
+            try: return str(v)
+            except Exception: return v
+        return v
+
+    # hoved-retry loop
+    last_err = None
+    qty_key = "quantity"
+    for attempt in range(1, int(max_retries)+1):
+        # juster kvantum/price til exchange filtere om de finnes
+        try:
+            if qty_key in kwargs and kwargs[qty_key] is not None:
+                qf = float(kwargs[qty_key])
+                if step > 0:
+                    qf = max(step, _round_to_step(qf, step))
+                kwargs[qty_key] = qf
+            if "price" in kwargs and kwargs["price"] is not None and tick > 0:
+                kwargs["price"] = _round_to_tick(kwargs["price"], tick)
+            if "stopPrice" in kwargs and kwargs["stopPrice"] is not None and tick > 0:
+                kwargs["stopPrice"] = _round_to_tick(kwargs["stopPrice"], tick)
+        except Exception:
+            pass
+
+        send_kwargs = {k: _to_str_if_needed(k, v) for k, v in kwargs.items()}
+
+        try:
+            # primærkall
+            resp = client.new_order(**send_kwargs)
+            # marker idem "ok"
+            try:
+                _idem[coid] = "ok"
+                with open(_idem_file, "w", encoding="utf-8") as _f:
+                    _json.dump(_idem, _f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+            return resp
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+
+            # kjente mønstre
+            is_rate = ("status code: 429" in msg) or ("status code: 418" in msg) or ("too many" in msg)
+            is_ts   = ("timestamp" in msg) or ("recvwindow" in msg) or ("-1021" in msg)
+            is_prec = ("precision" in msg) or ("invalid quantity" in msg) or ("-1013" in msg) or ("min_notional" in msg) or ("lot size" in msg)
+            is_margin = ("insufficient" in msg) or ("-2019" in msg)
+            is_reduce = ("reduceonly" in msg) or ("-4164" in msg)
+            is_exist  = ("exist" in msg) and ("order" in msg)
+
+            # duplikat / already exists -> suksess
+            if is_exist:
+                try:
+                    _idem[coid] = "ok"
+                    with open(_idem_file, "w", encoding="utf-8") as _f:
+                        _json.dump(_idem, _f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+                return {"clientOrderId": coid, "accepted": "exists"}
+
+            # precision -> prøv å korrigere tick/step
+            if is_prec:
+                try:
+                    if qty_key in kwargs and kwargs[qty_key] is not None and step > 0:
+                        kwargs[qty_key] = max(step, _round_to_step(float(kwargs[qty_key]), step))
+                    if "price" in kwargs and kwargs.get("price") not in (None, "") and tick > 0:
+                        kwargs["price"] = _round_to_tick(kwargs["price"], tick)
+                    if "stopPrice" in kwargs and kwargs.get("stopPrice") not in (None, "") and tick > 0:
+                        kwargs["stopPrice"] = _round_to_tick(kwargs["stopPrice"], tick)
+                except Exception:
+                    pass
+
+            # insufficient margin -> skaler qty litt ned
+            if is_margin and qty_key in kwargs and kwargs[qty_key] not in (None, ""):
+                try:
+                    qf = float(kwargs[qty_key])
+                    qf = qf * 0.95  # -5%
+                    if step > 0:
+                        qf = max(step, _round_to_step(qf, step))
+                    kwargs[qty_key] = qf
+                except Exception:
+                    pass
+
+            # reduceOnly/closePosition konflikt -> flip mellom dem
+            if is_reduce:
+                ro = str(kwargs.get("reduceOnly", "")).lower()
+                cp = kwargs.get("closePosition", None)
+                if ro in ("true","1",True):
+                    kwargs.pop("reduceOnly", None)
+                    kwargs["closePosition"] = True
+                elif cp is True:
+                    kwargs.pop("closePosition", None)
+                    kwargs["reduceOnly"] = "true"
+
+            # timestamp/recvWindow -> øk window litt
+            if is_ts:
+                try:
+                    rw = int(kwargs.get("recvWindow", 5000))
+                    kwargs["recvWindow"] = min(60000, int(rw * 1.5))
+                except Exception:
+                    pass
+
+            # backoff
+            delay = backoff_base * (2 ** (attempt-1)) + random.random()*0.25
+            try:
+                if notifier: notifier.info(f"Retry order ({attempt}/{max_retries}) {symbol} {side} {otype}: {e} (sleep {delay:.2f}s)")
+                else: print(f"[RETRY] {symbol} {side} {otype}: {e} (sleep {delay:.2f}s)")
+            except Exception:
+                pass
+            time.sleep(delay)
+
+    # alle forsøk feilet
+    if notifier:
+        try: notifier.error(f"Order FAIL {symbol} {side} {otype}: {last_err}")
+        except Exception: pass
+    raise last_err
+
+def 
+def _place_live_bracket(client: UMFutures, cfg: dict, broker, paper_mode: bool, notifier, symbol: str, side: str,
+                        qty: float, entry: float, stop: float, tp1: float, partial_pct: float):
+    """
+    Plasser market-entry + STOP_MARKET + TP1 (+ TP2 hvis konfigurert).
+    """
     # Filters & rounding
     try:
         flt = get_symbol_filters(client, symbol)
@@ -232,7 +726,7 @@ def _place_live_bracket(client: UMFutures, cfg: dict, broker, paper_mode: bool, 
         tick, step = _exchange_filters(client, symbol)  # fallback
         flt = {'min_qty': step, 'min_notional': 0.0}
 
-    # Cap against margin & normalize against minQty/minNotional
+    # Cap mot margin & normaliser qty
     try:
         bal = current_balance(paper_mode, broker, client)
     except Exception:
@@ -243,29 +737,54 @@ def _place_live_bracket(client: UMFutures, cfg: dict, broker, paper_mode: bool, 
     _, qty_norm = normalize_price_qty(client, symbol, entry, qty)
     qty_r = max(step, _round_step(qty_norm, step))
 
-    # Market entry
+    # MARKET entry
     _place_order_with_retries(client, symbol=symbol, side=side, type="MARKET", quantity=str(qty_r))
 
-    # Protective stop (MARK_PRICE)
+    # STOP (MARK_PRICE)
     side_sl = "SELL" if side=="BUY" else "BUY"
     stop_r = _round_tick(stop, tick)
     try:
-        _place_order_with_retries(client, symbol=symbol, side=side_sl, type="STOP_MARKET", workingType="MARK_PRICE",
-                         stopPrice=str(stop_r), closePosition=True)
+        _place_order_with_retries(client, symbol=symbol, side=side_sl, type="STOP_MARKET",
+                                  workingType="MARK_PRICE", stopPrice=str(stop_r), closePosition=True)
     except Exception:
-        _place_order_with_retries(client, symbol=symbol, side=side_sl, type="STOP_MARKET", workingType="MARK_PRICE",
-                         stopPrice=str(stop_r), quantity=str(qty_r), reduceOnly="true")
+        _place_order_with_retries(client, symbol=symbol, side=side_sl, type="STOP_MARKET",
+                                  workingType="MARK_PRICE", stopPrice=str(stop_r), quantity=str(qty_r), reduceOnly="true")
 
-    # Partial TP (MARK_PRICE)
-    qty_tp = max(step, _round_step(qty_r * (partial_pct/100.0), step))
-    tp_r = _round_tick(tp1, tick)
+    # TP1 (MARK_PRICE, reduceOnly)
+    tp_cfg = cfg.get("take_profit", {}) or {}
+    partial_pct1 = float(tp_cfg.get("partial_pct", partial_pct))
+    qty_tp1 = max(step, _round_step(qty_r * (partial_pct1/100.0), step))
+    tp1_r = _round_tick(tp1, tick)
     try:
-        _place_order_with_retries(client, symbol=symbol, side=side_sl, type="TAKE_PROFIT_MARKET", workingType="MARK_PRICE",
-                         stopPrice=str(tp_r), quantity=str(qty_tp), reduceOnly="true")
+        _place_order_with_retries(client, symbol=symbol, side=side_sl, type="TAKE_PROFIT_MARKET",
+                                  workingType="MARK_PRICE", stopPrice=str(tp1_r),
+                                  quantity=str(qty_tp1), reduceOnly="true")
     except Exception:
         pass
-    return {"qty_r": qty_r, "stop_r": stop_r, "tp_r": tp_r}
 
+    # TP2 (valgfri): beregn via R = |entry - stop|
+    tp2_rtn = None
+    partial2_pct = float(tp_cfg.get("partial2_pct", 0.0) or 0.0)
+    partial2_r = float(tp_cfg.get("partial2_r", 0.0) or 0.0)
+    if partial2_pct > 0.0 and partial2_r > 0.0:
+        rdist = abs(entry - stop)
+        tp2 = entry + (partial2_r * rdist) * (1 if side=="BUY" else -1)
+        tp2_r = _round_tick(tp2, tick)
+        rem_qty = max(step, _round_step(qty_r - qty_tp1, step))
+        qty_tp2 = max(step, _round_step(qty_r * (partial2_pct/100.0), step))
+        qty_tp2 = min(qty_tp2, rem_qty)
+        if qty_tp2 >= step:
+            try:
+                _place_order_with_retries(client, symbol=symbol, side=side_sl, type="TAKE_PROFIT_MARKET",
+                                          workingType="MARK_PRICE", stopPrice=str(tp2_r),
+                                          quantity=str(qty_tp2), reduceOnly="true")
+                tp2_rtn = tp2_r
+            except Exception:
+                pass
+
+    return {"qty_r": qty_r, "stop_r": stop_r, "tp_r": tp1_r, "tp2_r": tp2_rtn, "partial_pct1": partial_pct1}
+
+def 
 def _position_amt(client: UMFutures, symbol: str) -> float:
     try:
         acc = client.account()
@@ -355,7 +874,171 @@ def main():
             lines = [f"🛠️ Auto-fix (live): mål {want_mt}/{want_lev}x"]
             for sym in symbols:
                 try:
-                    res = autofix_symbol(client, sym, desired_margin=want_mt, desired_leverage=want_lev, recvWindow=5000)
+                    
+            
+            
+            # --- Anti-pyramidering + re-entry cooldown ---
+
+            # --- Supertrend-trail (kjør tidlig, gjør ingenting hvis posisjon ikke er åpen) ---
+            try:
+                stcfg = (cfg.get("trail", {}) or {}).get("supertrend", {}) or {}
+                if stcfg.get("enabled", True):
+                    # er posisjon åpen?
+                    entry_px, pos_side = _position_entry_side(client, sym)
+                    if entry_px is not None and pos_side in ("LONG","SHORT"):
+                        # df for entry-TF (bruk eksisterende df1h_closed hvis mulig)
+                        _df = df1h_closed if "df1h_closed" in locals() and df1h_closed is not None else None
+                        if _df is None or len(_df) < 30:
+                            _df = get_klines(client, sym, cfg["timeframes"]["entry"], limit=150)
+
+                        from indicators import supertrend_from_df
+                        st_p = int(stcfg.get("period", 10)); st_m = float(stcfg.get("multiplier", 3.0))
+                        st_line, st_dir = supertrend_from_df(_df, st_p, st_m)
+
+                        atr_p = max(5, int(cfg.get("volatility", {}).get("atr_period", 14)))
+                        atr_val = _atr_value(_df, atr_p) or 0.0
+                        buf = float(stcfg.get("buffer_atr_mult", 0.20)) * atr_val
+
+                        e, cur_sp = _entry_and_stop(client, sym)
+                        if e is None:
+                            e = float(_df["close"].iloc[-2])  # fallback
+                        last_close = float(_df["close"].iloc[-1])
+
+                        # baseline R0 (første gang vi ser posisjonen)
+                        R0 = _trail_get_R0(sym)
+                        if R0 is None and cur_sp is not None:
+                            R0 = abs(float(e) - float(cur_sp))
+                            if R0 and R0 > 0:
+                                _trail_set_R0(sym, R0)
+
+                        minR = float(stcfg.get("min_gain_R", 0.5))
+                        gainR = 999.0
+                        if R0 and R0 > 0:
+                            if pos_side == "LONG":
+                                gainR = (last_close - float(e)) / R0
+                            else:
+                                gainR = (float(e) - last_close) / R0
+
+                        if (st_line is not None) and (gainR >= minR):
+                            if pos_side == "LONG":
+                                cand = float(st_line) - buf
+                                best = min(cand, last_close*0.999)
+                                _tighten_stop_if_better(client, cfg, sym, "LONG", best)
+                            else:
+                                cand = float(st_line) + buf
+                                best = max(cand, last_close*1.001)
+                                _tighten_stop_if_better(client, cfg, sym, "SHORT", best)
+            except Exception:
+                pass
+
+            # --- Binance leverage/margin guard + riktig margin-asset / free balance ---
+            try:
+                bguard = cfg.get("binance_guard", {}) or {}
+                if bguard.get("enabled", True):
+                    _ensure_leverage_margin(client, sym, int(bguard.get("leverage", 12)), str(bguard.get("marginType", "ISOLATED")).upper())
+                    m_asset = _symbol_margin_asset(client, sym)  # f.eks. USDT eller USDC
+                    bals = _futures_balances(client)
+                    free_amt = float(bals.get(m_asset, 0.0))
+
+                    # grovt anslag på nødvendig margin krever qty – vi gjør en enkel sanity: må ha noe fri margin
+                    if free_amt <= 0:
+                        try:
+                            print(f"[SKIP] {sym}: Margin asset {m_asset} free=0.0 — sett inn {m_asset} eller bytt kontrakt (ex: BTCUSDT vs BTCUSDC).")
+                        except Exception:
+                            pass
+                        try:
+                            df1h_tmp = get_klines(client, sym, cfg["timeframes"]["entry"], limit=2)
+                            mark_emitted(sym, _closed_slice(df1h_tmp))
+                        except Exception:
+                            pass
+                        continue
+            except Exception:
+                pass
+            # Finn om posisjon er åpen NÅ
+            _is_open_now = False
+            try:
+                if _position_amt(client, sym) != 0.0 or sym in live_positions:
+                    _is_open_now = True
+            except Exception:
+                pass
+
+            # Dersom den VAR åpen forrige runde men er LUKKET nå -> start cooldown
+            try:
+                if _HAD_OPEN_LAST.get(sym, False) and not _is_open_now:
+                    _cooldown_start(sym, _cooldown_hours(cfg))
+            except Exception:
+                pass
+
+            # Oppdater status for denne runden (før ev. continue)
+            _HAD_OPEN_LAST[sym] = _is_open_now
+
+            # Hvis posisjon er åpen -> aldri ta ny entry (one-way mode vern)
+            if _is_open_now:
+                try:
+                    # markér bar som behandlet for å unngå spam i samme bar
+                    df1h_tmp = get_klines(client, sym, cfg["timeframes"]["entry"], limit=2)
+                    mark_emitted(sym, _closed_slice(df1h_tmp))
+                except Exception:
+                    pass
+                continue
+
+            # Hvis cooldown aktiv -> ikke ta entry enda
+            if _cooldown_active(sym):
+                try:
+                    df1h_tmp = get_klines(client, sym, cfg["timeframes"]["entry"], limit=2)
+                    mark_emitted(sym, _closed_slice(df1h_tmp))
+                except Exception:
+                    pass
+                continue
+# --- Anti-pyramidering + re-entry cooldown ---
+            # Finn om posisjon er åpen NÅ
+            _is_open_now = False
+            try:
+                if _position_amt(client, sym) != 0.0 or sym in live_positions:
+                    _is_open_now = True
+            except Exception:
+                pass
+
+            # Dersom den VAR åpen forrige runde men er LUKKET nå -> start cooldown
+            try:
+                if _HAD_OPEN_LAST.get(sym, False) and not _is_open_now:
+                    _cooldown_start(sym, _cooldown_hours(cfg))
+            except Exception:
+                pass
+
+            # Oppdater status for denne runden (før ev. continue)
+            _HAD_OPEN_LAST[sym] = _is_open_now
+
+            # Hvis posisjon er åpen -> aldri ta ny entry (one-way mode vern)
+            if _is_open_now:
+                try:
+                    # markér bar som behandlet for å unngå spam i samme bar
+                    df1h_tmp = get_klines(client, sym, cfg["timeframes"]["entry"], limit=2)
+                    mark_emitted(sym, _closed_slice(df1h_tmp))
+                except Exception:
+                    pass
+                continue
+
+            # Hvis cooldown aktiv -> ikke ta entry enda
+            if _cooldown_active(sym):
+                try:
+                    df1h_tmp = get_klines(client, sym, cfg["timeframes"]["entry"], limit=2)
+                    mark_emitted(sym, _closed_slice(df1h_tmp))
+                except Exception:
+                    pass
+                continue
+# Unngå å legge til posisjon hvis en allerede er åpen (one-way mode vern)
+            try:
+                if _position_amt(client, sym) != 0.0 or sym in live_positions:
+                    try:
+                        df1h_tmp = get_klines(client, sym, cfg["timeframes"]["entry"], limit=2)
+                        mark_emitted(sym, _closed_slice(df1h_tmp))
+                    except Exception:
+                        pass
+                    continue
+            except Exception:
+                pass
+res = autofix_symbol(client, sym, desired_margin=want_mt, desired_leverage=want_lev, recvWindow=5000)
                     actions_txt = ", ".join(res.get("actions", []))
                     after_margin = res.get("after", {}).get("margin")
                     after_lev = res.get("after", {}).get("leverage")
@@ -680,6 +1363,13 @@ def main():
 
                 pb = pullback_signal(df1h_closed, bias, eff_cfg)
                 bo = breakout_signal(df1h_closed, bias, eff_cfg)
+
+                # Konfluens-skalering: trades tas, men sizing justeres etter PB/BO
+                sz = eff_cfg.get("entries", {}).get("sizing", {}) or {}
+                both_mult = float(sz.get("both_signals_mult", 1.0))
+                single_mult = float(sz.get("single_signal_mult", 0.75))
+                signal_mult = both_mult if (pb and bo) else single_mult
+
                 if not pb and not bo:
                     # --- Mean Reversion i RANGE-regime ---
                     if regime == Regime.RANGE and bool(eff_cfg.get("entries",{}).get("mean_reversion",{}).get("enabled", True)):
@@ -708,7 +1398,92 @@ def main():
                             lev_cap_mr = int(mrc.get("lev_cap", 10))
 
                             bal = current_balance(paper_mode, broker, client) or 1000.0
-                            risk_usdc = choose_risk_usdc(bal, eff_cfg, {"win_rate": 0.5, "avg_rr": 2.0}) * risk_mult
+                            r\n                # --- Volatilitets-vern (ATR%%) ---
+try:
+    vcfg = cfg.get("volatility", {}) or {}
+    if vcfg.get("enabled", True):
+        per = int(vcfg.get("atr_period", 14))
+        atrp = _atr_percent(df1h_closed, per)
+        if atrp is not None:
+            scale_thr = float(vcfg.get("atrp_scale_threshold", 0.015))
+            block_thr = float(vcfg.get("atrp_block_threshold", 0.035))
+            if atrp >= block_thr:
+                # blokkér entry nå (for denne bar)
+                try:
+                    df1h_tmp = get_klines(client, sym, cfg["timeframes"]["entry"], limit=2)
+                    mark_emitted(sym, _closed_slice(df1h_tmp))
+                except Exception:
+                    pass
+                try:
+                    print(f"[SKIP] {sym}: ATR%%={atrp:.3%} >= {block_thr:.3%} (block).")
+                except Exception:
+                    pass
+                continue
+            elif atrp >= scale_thr:
+                mult = float(vcfg.get("atrp_scale", 0.85))
+                risk_usdc *= max(0.1, min(2.0, mult))
+                try:
+                    print(f"[INFO] {sym}: ATR%%={atrp:.3%} >= {scale_thr:.3%} (scale x{mult}).")
+                except Exception:
+                    pass
+except Exception:
+    pass\nisk_usdc = choose_risk_usdc(bal, eff_cfg, {"win_rate": 0.5, "avg_rr": 2.0}) * risk_mult
+                # --- Myke filtre: skaler risiko etter VWAP / Supertrend / OBV ---
+                try:
+                    filter_mult = 1.0
+                    filt = cfg.get("filters", {}) or {}
+                    last_close = float(df1h_closed["close"].iloc[-1])
+                    bias_dir = str(bias).upper() if bias is not None else "FLAT"
+                
+                    # VWAP (session)
+                    vwcfg = (filt.get("vwap") or {})
+                    if vwcfg.get("enabled", True):
+                        from indicators import vwap_session_from_df
+                        vwap_val = vwap_session_from_df(df1h_closed)
+                        if vwap_val is not None:
+                            sc = float(vwcfg.get("scale", 0.85))
+                            if bias_dir == "LONG" and last_close < vwap_val:
+                                filter_mult *= sc
+                            elif bias_dir == "SHORT" and last_close > vwap_val:
+                                filter_mult *= sc
+                
+                    # Supertrend
+                    stcfg = (filt.get("supertrend") or {})
+                    if stcfg.get("enabled", True):
+                        from indicators import supertrend_from_df
+                        st_p = int(stcfg.get("period", 10)); st_m = float(stcfg.get("multiplier", 3.0))
+                        st_line, st_dir = supertrend_from_df(df1h_closed, st_p, st_m)
+                        sc = float(stcfg.get("scale", 0.80))
+                        if st_dir in (-1, 1):
+                            if bias_dir == "LONG" and st_dir < 0:
+                                filter_mult *= sc
+                            elif bias_dir == "SHORT" and st_dir > 0:
+                                filter_mult *= sc
+                
+                    # OBV (valgfri)
+                    obvcfg = (filt.get("obv") or {})
+                    if obvcfg.get("enabled", False):
+                        from indicators import obv_from_df
+                        lb = int(obvcfg.get("lookback", 50))
+                        sc = float(obvcfg.get("scale", 0.80))
+                        obv = obv_from_df(df1h_closed)
+                        if len(obv) > lb + 2:
+                            import numpy as _np
+                            y = _np.array(obv[-lb:])
+                            x = _np.arange(lb)
+                            slope_obv = _np.polyfit(x, y, 1)[0]
+                            y_p = _np.array(df1h_closed["close"].iloc[-lb:])
+                            slope_price = _np.polyfit(x, y_p, 1)[0]
+                            # enkel divergensregel: pris opp men OBV ikke -> skaler; motsatt for short
+                            if (bias_dir == "LONG" and slope_price > 0 and slope_obv <= 0) or                (bias_dir == "SHORT" and slope_price < 0 and slope_obv >= 0):
+                                filter_mult *= sc
+                
+                    risk_usdc *= max(0.1, min(2.0, filter_mult))
+                except Exception as _e:
+                    # ikke fall over ende ved små problemer
+                    pass
+
+                risk_usdc *= max(0.1, min(2.0, signal_mult))
                             plan["tp_partial"] = plan["entry"] + (tp_r * plan["r_distance"]) * (1 if side=='BUY' else -1)
                             plan["trail_atr_mult"] = min(plan["trail_atr_mult"], trail_mult)
 
@@ -784,7 +1559,35 @@ def main():
                     target_lev = min(target_lev, lev_cap)
 
                 bal = current_balance(paper_mode, broker, client) or 1000.0
-                risk_usdc = choose_risk_usdc(bal, eff_cfg, {"win_rate": 0.5, "avg_rr": 2.0})
+                r\n                # --- Funding-aware risiko (skaler/blokker) ---
+try:
+    fcfg = cfg.get("funding", {}) or {}
+    if fcfg.get("enabled", True):
+        fr = _premium_funding_rate(client, sym)  # per 8t
+        abs_fr, penal = _dir_penalized(bias, fr, bool(fcfg.get("directional", True)))
+        sc_thr = float(fcfg.get("scale_threshold", 0.0005))
+        bl_thr = float(fcfg.get("block_threshold", 0.0012))
+        if penal and abs_fr >= bl_thr:
+            # blokkér entry
+            try:
+                df1h_tmp = get_klines(client, sym, cfg["timeframes"]["entry"], limit=2)
+                mark_emitted(sym, _closed_slice(df1h_tmp))
+            except Exception:
+                pass
+            try:
+                print(f"[SKIP] {sym}: Funding {fr:.4%} (penal) >= block {bl_thr:.4%}.")
+            except Exception:
+                pass
+            continue
+        elif penal and abs_fr >= sc_thr:
+            mult = float(fcfg.get("scale", 0.85))
+            risk_usdc *= max(0.1, min(2.0, mult))
+            try:
+                print(f"[INFO] {sym}: Funding {fr:.4%} (penal) >= scale {sc_thr:.4%} -> risk x{mult}.")
+            except Exception:
+                pass
+except Exception:
+    pass\nisk_usdc = choose_risk_usdc(bal, eff_cfg, {"win_rate": 0.5, "avg_rr": 2.0})
                 if _is_meme(sym):
                     rm = float(meme_per.get(sym, {}).get("risk_mult", risk_mult_default))
                     risk_usdc *= rm
@@ -856,6 +1659,7 @@ def main():
 
                         bal2 = current_balance(paper_mode, broker, client) or 1000.0
                         risk2 = choose_risk_usdc(bal2, eff_cfg, {"win_rate": 0.5, "avg_rr": 2.0})
+                        risk2 *= max(0.1, min(2.0, signal_mult))
                         qty2 = position_qty(plan_snapshot["entry"], plan_snapshot["stop"], risk2)
                         if qty2 <= 0:
                             mark_emitted(sym, df1h_closed); continue
@@ -892,6 +1696,7 @@ def main():
 
                         bal2 = current_balance(paper_mode, broker, client) or 1000.0
                         risk2 = choose_risk_usdc(bal2, eff_cfg, {"win_rate": 0.5, "avg_rr": 2.0})
+                        risk2 *= max(0.1, min(2.0, signal_mult))
                         qty2 = position_qty(plan_snapshot["entry"], plan_snapshot["stop"], risk2)
                         if qty2 <= 0:
                             mark_emitted(sym, df1h_closed); continue

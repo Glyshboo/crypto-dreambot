@@ -42,6 +42,10 @@
     "ensemble": {
       "full_if_both": true,
       "half_if_single": true
+    },
+    "sizing": {
+      "both_signals_mult": 1.0,
+      "single_signal_mult": 0.75
     }
   },
   "stops": {
@@ -51,7 +55,9 @@
   },
   "take_profit": {
     "partial_r": 1.8,
-    "partial_pct": 40
+    "partial_pct": 40,
+    "partial2_r": 2.5,
+    "partial2_pct": 30
   },
   "trailing": {
     "atr_period": 14,
@@ -162,7 +168,8 @@
         0.7,
         0.5
       ]
-    }
+    },
+    "cooldown_bars_after_exit": 2
   },
   "simulation": {
     "slippage_pct": 0.0005
@@ -238,7 +245,7 @@
       }
     }
   },
-  "live_trading": true,
+  "live_trading": false,
   "micro_entry": {
     "ema_fast": 21,
     "ema_slow": 55,
@@ -295,6 +302,59 @@
         "max_shorts": 120,
         "killswitch": 600
       }
+    }
+  },
+  "filters": {
+    "vwap": {
+      "enabled": true,
+      "mode": "scale",
+      "scale": 0.85
+    },
+    "supertrend": {
+      "enabled": true,
+      "mode": "scale",
+      "period": 10,
+      "multiplier": 3.0,
+      "scale": 0.8
+    },
+    "obv": {
+      "enabled": false,
+      "mode": "scale",
+      "lookback": 50,
+      "scale": 0.8
+    }
+  },
+  "risk_manager": {
+    "max_parallel_positions": 4
+  },
+  "volatility": {
+    "enabled": true,
+    "atr_period": 14,
+    "atrp_scale_threshold": 0.015,
+    "atrp_scale": 0.85,
+    "atrp_block_threshold": 0.035
+  },
+  "funding": {
+    "enabled": true,
+    "directional": true,
+    "scale_threshold": 0.0005,
+    "scale": 0.85,
+    "block_threshold": 0.0012
+  },
+  "binance_guard": {
+    "enabled": true,
+    "leverage": 12,
+    "marginType": "ISOLATED",
+    "min_free_margin_ratio": 0.02
+  },
+  "trail": {
+    "supertrend": {
+      "enabled": true,
+      "period": 10,
+      "multiplier": 3.0,
+      "buffer_atr_mult": 0.2,
+      "min_gain_R": 0.5,
+      "timeframe": "entry"
     }
   }
 }
