@@ -1,185 +1,341 @@
-# -*- coding: utf-8 -*-
-"""
-strategy.py — Patch 02
-- Markedsregime-filtre (range/trend/strong_trend) basert på 4H og 1H.
-- ATR-basert SL/TP og trailing.
-- ADX-gating, volum-bekreftelse, dedup/cooldown, mikro-bekreftelse fra 15m.
-- Anti-spam (signal de-dupe på tvers av tidssteg).
-Denne modulen har ingen eksterne avhengigheter utover pandas/numpy.
-"""
-from dataclasses import dataclass
-from typing import Optional, Dict, Any
+# strategy.py — Step 2 (VERBOSE VERSION)
+# ------------------------------------------------------------
+# Funksjonelt lik den kompakte Steg 2-strategien, men med rikelige
+# kommentarer og hjelpefunksjoner for klarhet.
+# ------------------------------------------------------------
+
+from __future__ import annotations
+
+import math
 import numpy as np
 import pandas as pd
-import time
 
-# ---------- Datatyper ----------
-
-@dataclass
-class Signal:
-    symbol: str
-    side: str          # "long" eller "short"
-    price: float
-    sl: float
-    tp1: float
-    tp2: float
-    meta: Dict[str, Any]
+from indicators import rsi as _rsi, adx as _adx, atr as _atr
 
 
-class Strategy:
-    def __init__(self,
-                 regime_4h_adx_th: float = 18.0,
-                 strong_adx_th: float = 25.0,
-                 atr_mult_sl: float = 1.8,
-                 tp_r1: float = 2.0,
-                 tp_r2: float = 3.0,
-                 min_vol_mult: float = 1.0,
-                 cooldown_minutes: float = 20.0):
-        self.regime_4h_adx_th = regime_4h_adx_th
-        self.strong_adx_th = strong_adx_th
-        self.atr_mult_sl = atr_mult_sl
-        self.tp_r1 = tp_r1
-        self.tp_r2 = tp_r2
-        self.min_vol_mult = min_vol_mult
-        self.cooldown_minutes = cooldown_minutes
-        self._last_signal_time: Dict[str, float] = {}
-        self._last_signal_side: Dict[str, str] = {}
+class TrendBias:
+    LONG = "LONG"
+    SHORT = "SHORT"
+    FLAT = "FLAT"
 
-    # ---------- Indikatorer (enkle, interne) ----------
 
-    @staticmethod
-    def _ema(a: pd.Series, n: int) -> pd.Series:
-        return a.ewm(span=n, adjust=False).mean()
+class Regime:
+    RANGE = "range"
+    TREND = "trend"
+    STRONG_TREND = "strong_trend"
 
-    @staticmethod
-    def _atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-        high, low, close = df['high'], df['low'], df['close']
-        prev_close = close.shift(1)
-        tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-        return tr.rolling(n).mean()
 
-    @staticmethod
-    def _adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
-        # Enkel ADX (ikke Welles Wilder eksakt, men tilstrekkelig for gating)
-        high, low, close = df['high'], df['low'], df['close']
-        up = high.diff()
-        down = -low.diff()
-        plus_dm = np.where((up > down) & (up > 0), up, 0.0)
-        minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-        tr = Strategy._atr(df, n=n) * n  # approx TR_n
-        plus_di = 100 * pd.Series(plus_dm, index=df.index).rolling(n).sum() / tr.replace(0, np.nan)
-        minus_di = 100 * pd.Series(minus_dm, index=df.index).rolling(n).sum() / tr.replace(0, np.nan)
-        dx = ( (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan) ) * 100
-        return dx.rolling(n).mean()
+def ema(series, period):
+    return pd.Series(series).ewm(span=int(period), adjust=False).mean().values
 
-    @staticmethod
-    def _obv(df: pd.DataFrame) -> pd.Series:
-        close = df['close']
-        vol = df['volume']
-        direction = np.sign(close.diff().fillna(0.0))
-        return (direction * vol).fillna(0.0).cumsum()
 
-    # ---------- Hjelpere ----------
+def _ema_series(series: pd.Series, period: int) -> pd.Series:
+    return pd.Series(series).ewm(span=int(period), adjust=False).mean()
 
-    def _regime(self, df_4h: pd.DataFrame) -> str:
-        adx4 = self._adx(df_4h).iloc[-1]
-        ema_slow = self._ema(df_4h['close'], 200).iloc[-1]
-        ema_fast = self._ema(df_4h['close'], 50).iloc[-1]
-        bias_up = ema_fast > ema_slow
-        if adx4 >= self.strong_adx_th:
-            return 'strong_trend_up' if bias_up else 'strong_trend_down'
-        if adx4 >= self.regime_4h_adx_th:
-            return 'trend_up' if bias_up else 'trend_down'
-        return 'range'
 
-    def _vol_ok(self, df_1h: pd.DataFrame) -> bool:
-        v = df_1h['volume']
-        return v.iloc[-1] >= self.min_vol_mult * v.rolling(20).mean().iloc[-1]
+def _bollinger_bands_ewm(close: pd.Series, period: int, std_mult: float) -> tuple[pd.Series, pd.Series, pd.Series]:
+    mid = close.ewm(span=int(period), adjust=False).mean()
+    st = close.rolling(int(period)).std().fillna(method='bfill')
+    upper = mid + float(std_mult) * st
+    lower = mid - float(std_mult) * st
+    return mid, upper, lower
 
-    def _micro_conf(self, df_15m: pd.DataFrame, side: str) -> bool:
-        # Bruk OBV-slope som enkel momentum-bekreftelse
-        obv = self._obv(df_15m)
-        slope = (obv.iloc[-1] - obv.iloc[-5]) / 5.0
-        return (slope > 0) if side == 'long' else (slope < 0)
 
-    def _cooldown_passed(self, symbol: str, side: str) -> bool:
-        now = time.time()
-        last_t = self._last_signal_time.get(symbol, 0.0)
-        last_side = self._last_signal_side.get(symbol, '')
-        if last_side == side and (now - last_t) < self.cooldown_minutes * 60:
-            return False
+def _safe_last(series: pd.Series | np.ndarray | list) -> float:
+    if series is None:
+        return 0.0
+    try:
+        if isinstance(series, (pd.Series, pd.Index)):
+            return float(series.iloc[-1])
+        if isinstance(series, (list, np.ndarray)):
+            return float(series[-1])
+    except Exception:
+        pass
+    return float(series)
+
+
+def _nz(x: float, fallback: float = 0.0) -> float:
+    try:
+        if x is None:
+            return fallback
+        if isinstance(x, (float, int)):
+            if math.isnan(x):
+                return fallback
+            return float(x)
+        v = float(x)
+        if math.isnan(v):
+            return fallback
+        return v
+    except Exception:
+        return fallback
+
+
+_LAST_BAR_ID = {}
+_LAST_BAR_ID_MICRO = {}
+
+def should_emit(symbol: str, df_closed: pd.DataFrame, cooldown_bars: int = 2, throttle_seconds: int = 60) -> bool:
+    global _LAST_BAR_ID
+    try:
+        bid = int(df_closed["close_time"].iloc[-1])
+    except Exception:
         return True
+    last = _LAST_BAR_ID.get(symbol)
+    if last == bid:
+        return False
+    _LAST_BAR_ID[symbol] = bid
+    return True
 
-    # ---------- Offentlig API ----------
 
-    def analyze(self, symbol: str,
-                df_4h: pd.DataFrame,
-                df_1h: pd.DataFrame,
-                df_15m: Optional[pd.DataFrame] = None) -> Optional[Signal]:
-        """
-        Returnerer et signal hvis alle filtre er passert, ellers None.
-        Forventer OHLCV med kolonner: ['open','high','low','close','volume'].
-        """
-        assert all(col in df_1h.columns for col in ['open','high','low','close','volume']), "1H mangler kolonner"
-        assert all(col in df_4h.columns for col in ['open','high','low','close','volume']), "4H mangler kolonner"
+def mark_emitted(symbol: str, df_closed: pd.DataFrame):
+    return
 
-        regime = self._regime(df_4h)
-        adx1h = self._adx(df_1h).iloc[-1]
-        atr1h = self._atr(df_1h).iloc[-1]
-        price = float(df_1h['close'].iloc[-1])
 
-        # Volum-bekreftelse
-        if not self._vol_ok(df_1h):
-            return None
+def should_emit_micro(symbol: str, df_closed: pd.DataFrame, cooldown_bars: int = 2, throttle_seconds: int = 60) -> bool:
+    global _LAST_BAR_ID_MICRO
+    try:
+        bid = int(df_closed["close_time"].iloc[-1])
+    except Exception:
+        return True
+    key = f"{symbol}|15m"
+    last = _LAST_BAR_ID_MICRO.get(key)
+    if last == bid:
+        return False
+    _LAST_BAR_ID_MICRO[key] = bid
+    return True
 
-        # Retningsfilter + ADX-gating
-        side = None
-        if regime in ('trend_up','strong_trend_up'):
-            if adx1h >= self.regime_4h_adx_th:
-                side = 'long'
-        elif regime in ('trend_down','strong_trend_down'):
-            if adx1h >= self.regime_4h_adx_th:
-                side = 'short'
-        else:  # range
-            # enkel mean-reversion: mot ytterpunkter (kan toggles i config senere)
-            ema_mid = self._ema(df_1h['close'], 50).iloc[-1]
-            if price < ema_mid and adx1h < self.regime_4h_adx_th:
-                side = 'long'
-            elif price > ema_mid and adx1h < self.regime_4h_adx_th:
-                side = 'short'
 
-        if side is None:
-            return None
+def mark_emitted_micro(symbol: str, df_closed: pd.DataFrame):
+    return
 
-        # Mikro-bekreftelse fra 15m om tilgjengelig
-        if df_15m is not None and len(df_15m) >= 50:
-            if not self._micro_conf(df_15m, side):
-                return None
 
-        # Anti-spam / cooldown
-        if not self._cooldown_passed(symbol, side):
-            return None
+def _ema200_filter(df4h: pd.DataFrame, ema_period: int) -> tuple[float, float]:
+    close = pd.Series(df4h["close"])
+    ema200 = close.ewm(span=int(ema_period), adjust=False).mean()
+    return float(close.iloc[-1]), float(ema200.iloc[-1])
 
-        # SL/TP
-        sl = price - self.atr_mult_sl * atr1h if side == 'long' else price + self.atr_mult_sl * atr1h
-        r = abs(price - sl)
-        tp1 = price + self.tp_r1 * r if side == 'long' else price - self.tp_r1 * r
-        tp2 = price + self.tp_r2 * r if side == 'long' else price - self.tp_r2 * r
 
-        sig = Signal(
-            symbol=symbol,
-            side=side,
-            price=price,
-            sl=sl,
-            tp1=tp1,
-            tp2=tp2,
-            meta={
-                'regime': regime,
-                'adx1h': float(adx1h),
-                'atr1h': float(atr1h),
-            }
-        )
-        # registrer cooldown
-        self._last_signal_time[symbol] = time.time()
-        self._last_signal_side[symbol] = side
-        return sig
+def compute_trend_bias(df4h: pd.DataFrame, cfg: dict) -> str:
+    ema_period = int(cfg.get("trend_filter", {}).get("ema_period", 200))
+    adx_period = int(cfg.get("trend_filter", {}).get("adx_period", 14))
+    adx_min = float(cfg.get("trend_filter", {}).get("adx_min", 20))
+
+    last, ema_last = _ema200_filter(df4h, ema_period)
+    adxv = _safe_last(_adx(df4h["high"], df4h["low"], df4h["close"], period=adx_period))
+
+    if last > ema_last and adxv >= adx_min:
+        return TrendBias.LONG
+    if last < ema_last and adxv >= adx_min:
+        return TrendBias.SHORT
+    return TrendBias.FLAT
+
+
+def compute_market_score(df4h: pd.DataFrame, df1h_closed: pd.DataFrame) -> tuple[float, str]:
+    adx4 = _safe_last(_adx(df4h["high"], df4h["low"], df4h["close"], 14))
+    atr_abs = _safe_last(_atr(df1h_closed["high"], df1h_closed["low"], df1h_closed["close"], 14))
+    price = _nz(float(df1h_closed["close"].iloc[-1]), 1.0)
+    atr_pct = atr_abs / max(1e-9, price) * 100.0
+
+    score = max(0.0, min(100.0, 1.5 * float(adx4) + 3.0 * float(atr_pct)))
+    if score >= 70.0:
+        regime = Regime.STRONG_TREND
+    elif score >= 35.0:
+        regime = Regime.TREND
+    else:
+        regime = Regime.RANGE
+    return float(score), regime
+
+
+def compute_confidence(df4h: pd.DataFrame, df1h_closed: pd.DataFrame, bias: str, pb: bool, bo: bool) -> float:
+    adx4 = _safe_last(_adx(df4h["high"], df4h["low"], df4h["close"], 14))
+    atr_abs = _safe_last(_atr(df1h_closed["high"], df1h_closed["low"], df1h_closed["close"], 14))
+    price = _nz(float(df1h_closed["close"].iloc[-1]), 1.0)
+    atr_pct = atr_abs / max(1e-9, price)
+
+    base = 0.5 * min(1.0, float(adx4) / 50.0) + 0.5 * min(1.0, float(atr_pct) * 8.0)
+    if pb: base += 0.05
+    if bo: base += 0.05
+    return max(0.0, min(1.0, float(base)))
+
+
+def _rolling_extreme(df: pd.DataFrame, lookback: int, bias: str) -> float:
+    lb = max(2, int(lookback))
+    if bias == TrendBias.LONG:
+        return float(df["close"].rolling(lb).max().iloc[-2])
+    else:
+        return float(df["close"].rolling(lb).min().iloc[-2])
+
+
+def _body_vs_atr_pct(df1h_closed: pd.DataFrame, atr_period: int) -> tuple[float, float]:
+    body = abs(float(df1h_closed["close"].iloc[-1]) - float(df1h_closed["open"].iloc[-1]))
+    atr_abs = _safe_last(_atr(df1h_closed["high"], df1h_closed["low"], df1h_closed["close"], atr_period))
+    if atr_abs <= 0.0:
+        return 0.0, 0.0
+    return body, (body / atr_abs) * 100.0
+
+
+def _atr_pct_now(df1h_closed: pd.DataFrame, atr_period: int) -> float:
+    atr_abs = _safe_last(_atr(df1h_closed["high"], df1h_closed["low"], df1h_closed["close"], atr_period))
+    price = _nz(float(df1h_closed["close"].iloc[-1]), 1.0)
+    return float(atr_abs / max(1e-9, price) * 100.0)
+
+
+def pullback_signal(df1h_closed: pd.DataFrame, bias: str, cfg: dict) -> bool:
+    ema_fast = int(cfg.get("entries", {}).get("pullback", {}).get("ema_fast", 20))
+    rsi_period = int(cfg.get("entries", {}).get("pullback", {}).get("rsi_period", 14))
+    rsi_long_min = float(cfg.get("entries", {}).get("pullback", {}).get("rsi_long_min", 52))
+    rsi_short_max = float(cfg.get("entries", {}).get("pullback", {}).get("rsi_short_max", 48))
+
+    emaf = _ema_series(df1h_closed["close"], ema_fast)
+    rsi = _rsi(df1h_closed["close"], period=rsi_period)
+
+    if bias == TrendBias.LONG:
+        return float(rsi.iloc[-1]) > rsi_long_min and float(df1h_closed["close"].iloc[-1]) >= float(emaf.iloc[-1])
+    if bias == TrendBias.SHORT:
+        return float(rsi.iloc[-1]) < rsi_short_max and float(df1h_closed["close"].iloc[-1]) <= float(emaf.iloc[-1])
+    return False
+
+
+def breakout_signal(df1h_closed: pd.DataFrame, bias: str, cfg: dict) -> bool:
+    b = cfg.get("entries", {}).get("breakout", {})
+    lookback = int(b.get("lookback", 10))
+    vol_boost_pct = float(b.get("vol_boost_pct", 120.0))
+    min_atr_pct = float(b.get("min_atr_pct", 0.25))
+    atrp = int(cfg.get("stops", {}).get("atr_period", 14))
+
+    level = _rolling_extreme(df1h_closed, lookback, bias)
+    last_close = float(df1h_closed["close"].iloc[-1])
+    base = (last_close > level) if bias == TrendBias.LONG else (last_close < level)
+    if not base:
+        return False
+
+    _, body_pct = _body_vs_atr_pct(df1h_closed, atrp)
+    atr_now_pct = _atr_pct_now(df1h_closed, atrp)
+    return (body_pct >= vol_boost_pct) or (atr_now_pct >= min_atr_pct)
+
+
+def mean_reversion_signal(df1h_closed: pd.DataFrame, cfg: dict) -> str | None:
+    mr = cfg.get("entries", {}).get("mean_reversion", {})
+    if not bool(mr.get("enabled", True)):
+        return None
+    rsi_period = int(mr.get("rsi_period", 14))
+    rsi_low = float(mr.get("rsi_low", 35))
+    rsi_high = float(mr.get("rsi_high", 65))
+    bb_period = int(mr.get("bb_period", 20))
+    bb_std = float(mr.get("bb_std", 2.0))
+
+    close = pd.Series(df1h_closed["close"]).astype(float)
+    rsi_v = _rsi(close, period=rsi_period)
+    mid, upper, lower = _bollinger_bands_ewm(close, bb_period, bb_std)
+
+    c = float(close.iloc[-1])
+    if c <= float(lower.iloc[-1]) and float(rsi_v.iloc[-1]) <= rsi_low:
+        return "BUY"
+    if c >= float(upper.iloc[-1]) and float(rsi_v.iloc[-1]) >= rsi_high:
+        return "SELL"
+    return None
+
+
+def _compute_atr(df1h_closed: pd.DataFrame, cfg: dict) -> float:
+    period = int(cfg.get("stops", {}).get("atr_period", 14))
+    return _nz(_safe_last(_atr(df1h_closed["high"], df1h_closed["low"], df1h_closed["close"], period)), 0.0)
+
+
+def _r_distance(entry: float, stop: float) -> float:
+    return abs(float(entry) - float(stop))
+
+
+def _tp_partial_from_r(entry: float, rdist: float, r_multiple: float, side_long: bool) -> float:
+    if side_long:
+        return float(entry + r_multiple * rdist)
+    else:
+        return float(entry - r_multiple * rdist)
+
+
+def build_order_plan(df1h_closed: pd.DataFrame, bias: str, cfg: dict) -> dict | None:
+    a = _compute_atr(df1h_closed, cfg)
+    if a <= 0.0:
+        return None
+
+    r_mult = float(cfg.get("stops", {}).get("r_mult", 1.0))
+    trail_mult = float(cfg.get("trailing", {}).get("atr_mult", 2.3))
+    entry = float(df1h_closed["close"].iloc[-1])
+
+    if bias == TrendBias.LONG:
+        stop = float(entry - r_mult * a)
+        rdist = _r_distance(entry, stop)
+        tp1 = _tp_partial_from_r(entry, rdist, 1.8, side_long=True)
+    else:
+        stop = float(entry + r_mult * a)
+        rdist = _r_distance(entry, stop)
+        tp1 = _tp_partial_from_r(entry, rdist, 1.8, side_long=False)
+
+    return {
+        "atr": float(a),
+        "entry": float(entry),
+        "stop": float(stop),
+        "tp_partial": float(tp1),
+        "r_distance": float(rdist),
+        "trail_atr_mult": float(trail_mult),
+    }
+
+
+def get_atr_price_threshold(df1h_closed: pd.DataFrame, cfg: dict) -> tuple[float, float]:
+    a = _compute_atr(df1h_closed, cfg)
+    p = _nz(float(df1h_closed["close"].iloc[-1]), 1.0)
+    return float(a), float(a / max(1e-9, p))
+
+
+def volatility_guard(df1h_closed: pd.DataFrame, regime: str, cfg: dict) -> tuple[bool, str, float, float]:
+    atr_abs = _compute_atr(df1h_closed, cfg)
+    price = _nz(float(df1h_closed["close"].iloc[-1]), 1.0)
+    atr_pct = float(atr_abs / max(1e-9, price))
+    limit = float(cfg.get("volatility_guard", {}).get("atr_price_cap", 0.12))
+    if atr_pct >= limit:
+        return True, f"ATR/price {atr_pct:.2%} >= cap {limit:.2%}", atr_pct, limit
+    return False, "-", atr_pct, limit
+
+
+def micro_signal_ema_stoch(df15_closed: pd.DataFrame, bias_4h: str, cfg: dict) -> str | None:
+    mcfg = cfg.get("micro_entry", {})
+    ema_fast = int(mcfg.get("ema_fast", 21))
+    ema_slow = int(mcfg.get("ema_slow", 55))
+    rsi_period = int(mcfg.get("rsi_period", 14))
+    long_min = float(mcfg.get("rsi_long_min", 55))
+    short_max = float(mcfg.get("rsi_short_max", 45))
+
+    close = pd.Series(df15_closed["close"]).astype(float)
+    ema_f = close.ewm(span=ema_fast, adjust=False).mean()
+    ema_s = close.ewm(span=ema_slow, adjust=False).mean()
+    rsi_v = _rsi(close, period=rsi_period)
+
+    if bias_4h == TrendBias.LONG:
+        if float(ema_f.iloc[-1]) > float(ema_s.iloc[-1]) and float(rsi_v.iloc[-1]) >= long_min:
+            return "long"
+        return None
+
+    if bias_4h == TrendBias.SHORT:
+        if float(ema_f.iloc[-1]) < float(ema_s.iloc[-1]) and float(rsi_v.iloc[-1]) <= short_max:
+            return "short"
+        return None
+
+    return None
+
+# ==== Tillegg: ATR-median og killswitch-state for 15m ====
+def _atr_median(df_closed: pd.DataFrame, period: int = 14, lookback: int = 200) -> tuple[float, float]:
+    try:
+        if df_closed is None or len(df_closed) < max(period+2, 20):
+            return 0.0, 0.0
+        a = _atr(df_closed["high"], df_closed["low"], df_closed["close"], period=period)
+        a = pd.Series(a).astype(float)
+        cur = float(a.iloc[-1])
+        med = float(pd.Series(a.iloc[-int(lookback):]).median())
+        if med != med:  # NaN
+            med = 0.0
+        if cur != cur:
+            cur = 0.0
+        return cur, med
+    except Exception:
+        return 0.0, 0.0
+
+# Global: når (epoch sek.) et symbol er lov å trade igjen etter ATR-spike
+KILL_UNTIL = {}
